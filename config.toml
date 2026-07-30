@@ -1,0 +1,50 @@
+# Configuration partagee par backup.py et restore.py.
+
+[s3]
+bucket = "sauvegardes-sites"
+endpoint = "https://s3.eu-west-par.io.cloud.ovh.net"
+region = "eu-west-par"
+
+[backup]
+retention = 4
+compression_level = 3
+part_size_mb = 128
+buffer_mb = 128
+one_file_system = true
+
+# Sauvegarde CIBLEE : uniquement ces chemins + volumes Docker, pas tout le
+# systeme. Un chemin absent au moment du backup est ignore avec un simple
+# avertissement (ex: fail2ban non installe) plutot que de faire echouer la
+# sauvegarde entiere.
+include_paths = [
+    "/opt/wordpress",              # fichiers WordPress + docker-compose.yml/.env
+    "/etc/ufw",                    # regles firewall
+    "/etc/fail2ban",               # config fail2ban si personnalisee (ignore si absent)
+    "/etc/ssh/sshd_config",        # durcissement SSH (port, PermitRootLogin, etc.)
+    "/etc/cron.d",                 # taches planifiees systeme
+    "/etc/systemd/system/vps-backup.service",  # ce timer lui-meme, si installe
+    "/etc/systemd/system/vps-backup.timer",
+]
+
+# Volumes Docker NOMMES a inclure (resolus vers leur emplacement reel sur le
+# disque via `docker volume inspect` au moment du backup). Verifie la liste
+# exacte avec `docker volume ls` sur le VPS.
+docker_volumes = [
+    "dev_db_data",
+    "nginx-proxy_data",
+    "nginx-proxy_letsencrypt",
+]
+
+# Exclusions optionnelles a l'interieur des chemins ci-dessus (ex: caches
+# WordPress volumineux et non critiques).
+exclude = []
+
+[upload]
+threads = 4
+retries = 5
+retry_backoff_seconds = 5.0
+
+[paths]
+log_file = "logs/vps-backup.log"
+tmp_dir = "state"
+prefix = "vps-debian/"
