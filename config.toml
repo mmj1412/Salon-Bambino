@@ -48,3 +48,17 @@ retry_backoff_seconds = 5.0
 log_file = "logs/vps-backup.log"
 tmp_dir = "state"
 prefix = "vps-debian/"
+
+# Notifications email (optionnel). Desactive par defaut : mets enabled a
+# true et remplis les champs ci-dessous pour l'activer. Ce fichier contient
+# un mot de passe SMTP en clair : verifie ses permissions avec
+# `chmod 600 config.toml` (comme pour /root/.aws/credentials).
+[email]
+enabled = false
+smtp_server = "ssl0.ovh.net"
+smtp_port = 587
+address = ""
+password = ""
+recipients = []
+retries = 3
+retry_delay_seconds = 5.0

@@ -26,10 +26,16 @@ inventaire des paquets apt installes (dpkg --get-selections) est genere et
 inclus automatiquement a chaque run, pour pouvoir reinstaller les memes
 paquets sur un VPS neuf sans avoir a copier leurs binaires.
 
+Notifications email (optionnelles) : si [email] enabled = true dans
+config.toml, un email est envoye a la fin de `backup` en cas de succes
+(recap : cle, taille, duree, SHA256) et en cas d'echec (message d'erreur).
+Credentials SMTP lus depuis config.toml, jamais codes en dur dans le script.
+
 Commandes :
-    python3 backup.py backup   [--config config.toml] [--source /chemin]
-    python3 backup.py rotate   [--config config.toml] [--dry-run]
-    python3 backup.py check    [--config config.toml]
+    python3 backup.py backup      [--config config.toml] [--source /chemin]
+    python3 backup.py rotate      [--config config.toml] [--dry-run]
+    python3 backup.py check       [--config config.toml]
+    python3 backup.py test-email  [--config config.toml]
     python3 backup.py version
 
 `--source` est optionnel : s'il est omis, les sources sont resolues depuis
@@ -45,6 +51,7 @@ import json
 import logging
 import os
 import shutil
+import smtplib
 import socket
 import subprocess
 import sys
@@ -55,6 +62,7 @@ import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Optional
 
@@ -196,11 +204,27 @@ class PathsConfig:
 
 
 @dataclass
+class EmailConfig:
+    """Notifications email (optionnelles). Desactivees par defaut : une
+    config.toml existante sans section [email] continue de fonctionner
+    sans rien envoyer."""
+    enabled: bool = False
+    smtp_server: str = ""
+    smtp_port: int = 587
+    address: str = ""
+    password: str = ""
+    recipients: list[str] = field(default_factory=list)
+    retries: int = 3
+    retry_delay_seconds: float = 5.0
+
+
+@dataclass
 class Config:
     s3: S3Config
     backup: BackupConfig
     upload: UploadConfig
     paths: PathsConfig
+    email: EmailConfig
     base_dir: Path
 
     @property
@@ -256,7 +280,19 @@ def load_config(path: str | Path) -> Config:
         prefix=p.get("prefix", "vps-debian/"),
     )
 
-    cfg = Config(s3=s3_cfg, backup=backup_cfg, upload=upload_cfg, paths=paths_cfg, base_dir=config_path.resolve().parent)
+    e = raw.get("email", {})
+    email_cfg = EmailConfig(
+        enabled=bool(e.get("enabled", False)),
+        smtp_server=e.get("smtp_server", ""),
+        smtp_port=int(e.get("smtp_port", 587)),
+        address=e.get("address", ""),
+        password=e.get("password", ""),
+        recipients=list(e.get("recipients", [])),
+        retries=int(e.get("retries", 3)),
+        retry_delay_seconds=float(e.get("retry_delay_seconds", 5.0)),
+    )
+
+    cfg = Config(s3=s3_cfg, backup=backup_cfg, upload=upload_cfg, paths=paths_cfg, email=email_cfg, base_dir=config_path.resolve().parent)
     _validate(cfg)
     return cfg
 
@@ -283,6 +319,13 @@ def _validate(cfg: Config) -> None:
         errors.append("upload.retries doit etre >= 0")
     if not cfg.backup.include_paths and not cfg.backup.docker_volumes:
         errors.append("backup.include_paths et backup.docker_volumes sont tous les deux vides : rien a sauvegarder")
+    if cfg.email.enabled:
+        if not cfg.email.smtp_server:
+            errors.append("email.smtp_server requis quand email.enabled = true")
+        if not cfg.email.address or not cfg.email.password:
+            errors.append("email.address et email.password requis quand email.enabled = true")
+        if not cfg.email.recipients:
+            errors.append("email.recipients ne peut pas etre vide quand email.enabled = true")
     if errors:
         raise ConfigError("Configuration invalide :\n- " + "\n- ".join(errors))
 
@@ -892,6 +935,56 @@ def perform_rotation(cfg: Config, client, dry_run: bool = False) -> list[str]:
 
 
 # ============================================================================
+# EMAIL (notifications succes/echec) - adapte du script mail existant,
+# credentials lus depuis config.toml, jamais codes en dur ici.
+# ============================================================================
+
+
+def send_mail(cfg: EmailConfig, destinataires: list[str], subject: str, message: str) -> bool:
+    """Envoie un email (meme logique que le script mail existant : SMTP +
+    STARTTLS + retries), avec les credentials pris dans config.toml."""
+    if not destinataires:
+        logger.warning("Aucun destinataire configure pour l'email '%s' - envoi ignore", subject)
+        return False
+
+    for attempt in range(1, cfg.retries + 1):
+        server = None
+        try:
+            server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port)
+            server.starttls()
+            server.login(cfg.address, cfg.password)
+            for destinataire in destinataires:
+                msg = MIMEText(message, "plain", "utf-8")
+                msg["From"] = cfg.address
+                msg["To"] = destinataire
+                msg["Subject"] = subject
+                server.sendmail(cfg.address, destinataire, msg.as_string())
+            server.quit()
+            return True
+        except Exception as exc:
+            logger.warning("Erreur d'envoi email (tentative %d/%d) : %s", attempt, cfg.retries, exc)
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+            if attempt < cfg.retries:
+                time.sleep(cfg.retry_delay_seconds)
+    return False
+
+
+def notify(cfg: Config, subject: str, message: str) -> None:
+    """Envoie une notification email si active en config. N'interrompt
+    jamais la sauvegarde si l'envoi echoue - juste un warning en log."""
+    if not cfg.email.enabled:
+        return
+    if send_mail(cfg.email, cfg.email.recipients, subject, message):
+        logger.info("Email de notification envoye : %s", subject)
+    else:
+        logger.warning("Echec de l'envoi de l'email de notification (voir warnings ci-dessus)")
+
+
+# ============================================================================
 # CLI (Typer)
 # ============================================================================
 
@@ -943,13 +1036,37 @@ def backup(
 
             perform_rotation(cfg, client)
             logger.info("=== Sauvegarde terminee avec succes ===")
+
+        duration = datetime.now(timezone.utc) - started
         console.print(f"[green]Sauvegarde terminee :[/green] {result.key} ({human_size(result.total_size)})")
+        notify(
+            cfg,
+            subject=f"[vps-backup] Sauvegarde reussie - {socket.gethostname()}",
+            message=(
+                f"Sauvegarde terminee avec succes sur {socket.gethostname()}.\n\n"
+                f"Fichier : {result.key}\n"
+                f"Taille : {human_size(result.total_size)}\n"
+                f"Duree : {duration}\n"
+                f"Parties : {len(result.parts)}\n"
+                f"SHA256 : {result.sha256}\n"
+            ),
+        )
     except LockError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1)
     except Exception as exc:
         console.print(f"[red]Echec de la sauvegarde :[/red] {exc}")
         console.print(f"Voir les logs : {cfg.log_file}")
+        notify(
+            cfg,
+            subject=f"[vps-backup] ECHEC de la sauvegarde - {socket.gethostname()}",
+            message=(
+                f"La sauvegarde a echoue sur {socket.gethostname()}.\n\n"
+                f"Erreur : {exc}\n\n"
+                f"Consulte les logs pour le detail : {cfg.log_file}\n"
+                f"La reprise sera automatique au prochain lancement (state/resume.json)."
+            ),
+        )
         raise typer.Exit(code=1)
 
 
@@ -1013,6 +1130,27 @@ def check(config: Path = ConfigOption) -> None:
 
     check_item("Connexion S3 + bucket", _s3_check)
     console.print(table)
+
+
+@app.command("test-email")
+def test_email(config: Path = ConfigOption) -> None:
+    """Envoie un email de test, pour valider la config SMTP sans lancer de vraie sauvegarde."""
+    cfg = _load(config)
+    if not cfg.email.enabled:
+        console.print("[yellow]email.enabled = false dans config.toml - active-le avant de tester.[/yellow]")
+        raise typer.Exit(code=1)
+
+    ok = send_mail(
+        cfg.email,
+        cfg.email.recipients,
+        subject=f"[vps-backup] Email de test - {socket.gethostname()}",
+        message=f"Ceci est un email de test envoye par vps-backup depuis {socket.gethostname()}.\nSi tu le reçois, la configuration SMTP fonctionne.",
+    )
+    if ok:
+        console.print(f"[green]Email de test envoye avec succes a :[/green] {', '.join(cfg.email.recipients)}")
+    else:
+        console.print("[red]Echec de l'envoi - voir les logs pour le detail (identifiants, port, pare-feu sortant...).[/red]")
+        raise typer.Exit(code=1)
 
 
 @app.command()
